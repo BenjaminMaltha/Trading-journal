@@ -133,7 +133,9 @@ const S = {
   view: 'trades', pair: 'all', period: ls.get('period', 'all'),
   accounts: [], trades: [],
   form: null, detail: null, accForm: null, lightbox: null,
-  toast: null, busy: false, loginErr: null
+  toast: null, busy: false, loginErr: null,
+  statsTab: ls.get('statsTab', 'week'), weekOffset: 0,
+  reviews: [], reviewsMissing: false, rv: null
 };
 const urlCache = {};
 let toastTimer = null;
@@ -187,6 +189,10 @@ async function loadAll() {
   S.accounts = a.data || [];
   S.trades = t.data || [];
   S.loaded = true;
+  render();
+  const r = await sb.from('weekly_reviews').select('*');
+  if (r.error) { S.reviewsMissing = true; console.warn(r.error.message); }
+  else { S.reviewsMissing = false; S.reviews = r.data || []; }
   render();
 }
 async function ensureUrls(paths) {
@@ -580,10 +586,16 @@ function curveSvg(curve) {
     '<polyline points="' + pts + '" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>' +
     '<div class="row between hint"><span>Start 0R</span><span>Hoogste ' + fmtR(max) + ' · Nu <span class="' + cls(last) + '">' + fmtR(last) + '</span></span></div>';
 }
+function statsTabs() {
+  return '<div class="tabs" role="group" aria-label="Weergave">' +
+    '<button type="button" data-a="stats-tab" data-v="week" aria-pressed="' + (S.statsTab === 'week') + '" class="' + (S.statsTab === 'week' ? 'on' : '') + '">Weekreview</button>' +
+    '<button type="button" data-a="stats-tab" data-v="all" aria-pressed="' + (S.statsTab === 'all') + '" class="' + (S.statsTab === 'all' ? 'on' : '') + '">Totaal</button></div>';
+}
 function statsView() {
+  if (S.statsTab === 'week') return statsTabs() + weekView();
   const list = filteredTrades();
   const s = computeStats(list);
-  let html = filterChips();
+  let html = statsTabs() + filterChips();
   if (!s.closed) return html + '<div class="empty"><b>Nog geen statistieken</b><span>Log trades met een resultaat in R, dan verschijnen hier je cijfers.</span></div>';
   html += '<div class="kpis three">' +
     kpiHtml('Winrate', s.winrate == null ? '–' : s.winrate + '%', '', s.wins + ' W · ' + s.losses + ' V' + (s.be ? ' · ' + s.be + ' BE' : '')) +
@@ -600,6 +612,122 @@ function statsView() {
   html += '<div class="card"><h3>Wat kost mij het meest</h3>' + (s.byMistake.length ? s.byMistake.map((m) =>
     '<div class="row between" style="font-size:13px"><span>' + esc(m.k) + ' <span class="muted">· ' + m.n + ' trade' + (m.n === 1 ? '' : 's') + '</span></span><span class="' + cls(m.r) + '">' + fmtR(m.r) + '</span></div>').join('')
     : '<span class="hint">Markeer fouten bij je trades (FOMO, te vroeg ingestapt…) om te zien wat je het meest kost.</span>') + '</div>';
+  return html;
+}
+/* ---------------- weekreview ---------------- */
+function weekStart(offset) { const d = startOfWeek(new Date()); d.setDate(d.getDate() + offset * 7); return d; }
+function isoWeek(d) {
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const day = t.getUTCDay() || 7; t.setUTCDate(t.getUTCDate() + 4 - day);
+  const y = new Date(Date.UTC(t.getUTCFullYear(), 0, 1));
+  return Math.ceil(((t - y) / 86400000 + 1) / 7);
+}
+function baseTrades() {
+  const accId = currentAccId();
+  let list = S.trades.filter((t) => t.mode === S.mode);
+  if (accId !== 'all') list = list.filter((t) => t.account_id === accId);
+  return list;
+}
+function tradesInWeek(offset) {
+  const from = weekStart(offset); const to = new Date(from); to.setDate(to.getDate() + 7);
+  return baseTrades().filter((t) => { const d = new Date(t.opened_at); return d >= from && d < to; });
+}
+function reviewFor(mode, key) { return S.reviews.find((r) => r.mode === mode && r.week_start === key); }
+function ensureDraft(key) {
+  const k = S.mode + '|' + key;
+  if (S.rv && S.rv.key === k) return S.rv;
+  const r = reviewFor(S.mode, key);
+  S.rv = { key: k, week_start: key, went_well: r ? r.went_well || '' : '', improve: r ? r.improve || '' : '', focus: r ? r.focus || '' : '', discipline: r ? r.discipline : null, dirty: false };
+  return S.rv;
+}
+async function saveReview() {
+  const d = S.rv;
+  if (!d || S.busy) return;
+  S.busy = true; render();
+  const row = { user_id: S.session.user.id, mode: S.mode, week_start: d.week_start, went_well: d.went_well.trim() || null, improve: d.improve.trim() || null, focus: d.focus.trim() || null, discipline: d.discipline, updated_at: new Date().toISOString() };
+  const { data, error } = await sb.from('weekly_reviews').upsert(row, { onConflict: 'user_id,mode,week_start' }).select().single();
+  S.busy = false;
+  if (error) { toast('Opslaan mislukt: ' + error.message); return; }
+  S.reviews = S.reviews.filter((r) => r.id !== data.id).concat([data]);
+  d.dirty = false;
+  toast('Weekreview opgeslagen');
+}
+function deltaTxt(cur, prev, fmt, suffix) {
+  if (prev == null || cur == null) return '';
+  const dlt = cur - prev;
+  if (Math.abs(dlt) < 1e-9) return 'gelijk aan vorige week';
+  return '<span class="' + cls(dlt) + '">' + fmt(dlt) + '</span> ' + (suffix || 't.o.v. vorige week');
+}
+function weekView() {
+  const off = S.weekOffset;
+  const start = weekStart(off); const end = new Date(start); end.setDate(end.getDate() + 6);
+  const key = dayKey(start);
+  const list = tradesInWeek(off);
+  const prevList = tradesInWeek(off - 1);
+  const s = computeStats(list);
+  const p = computeStats(prevList);
+  const dm = new Intl.DateTimeFormat('nl-NL', { day: 'numeric', month: 'short' });
+  const range = clean(dm.format(start)) + ' – ' + clean(dm.format(end));
+  let html = '<div class="weeknav"><button type="button" class="iconbtn" data-a="wk-prev" aria-label="Vorige week">' + I.back + '</button>' +
+    '<div class="wk-title"><b>Week ' + isoWeek(start) + (start.getFullYear() !== new Date().getFullYear() ? ' · ' + start.getFullYear() : '') + '</b><span>' + range + (off === 0 ? ' · deze week' : off === -1 ? ' · vorige week' : '') + '</span></div>' +
+    '<button type="button" class="iconbtn" data-a="wk-next" aria-label="Volgende week"' + (off >= 0 ? ' disabled style="opacity:.35"' : '') + '><span style="display:flex;transform:rotate(180deg)">' + I.back + '</span></button></div>';
+  if (off !== 0) html += '<button type="button" class="chip" data-a="wk-now" style="align-self:flex-start">Naar deze week</button>';
+
+  const prevKey = dayKey(weekStart(off - 1));
+  const prevRev = reviewFor(S.mode, prevKey);
+  if (prevRev && prevRev.focus) html += '<div class="card focus-card"><span class="lab-sm">Je focus voor deze week</span><div style="white-space:pre-wrap;font-size:15px">' + esc(prevRev.focus) + '</div></div>';
+
+  if (!list.length) {
+    html += '<div class="card"><span class="hint">' + (off === 0 ? 'Nog geen trades deze week. Je kunt je review alvast beginnen.' : 'Geen trades in deze week.') + '</span></div>';
+  } else {
+    const clean0 = list.filter((t) => !(t.mistakes || []).length).length;
+    const planPct = Math.round((clean0 / list.length) * 100);
+    const days = {};
+    list.forEach((t) => { if (t.result_r == null) return; const k = dayKey(new Date(t.opened_at)); days[k] = (days[k] || 0) + Number(t.result_r); });
+    const dayNames = ['Ma', 'Di', 'Wo', 'Do', 'Vr', 'Za', 'Zo'];
+    const dayRows = dayNames.map((n, i) => { const d = new Date(start); d.setDate(d.getDate() + i); const k = dayKey(d); const cnt = list.filter((t) => dayKey(new Date(t.opened_at)) === k).length; return { k: n, n: cnt, r: days[k] || 0, has: cnt > 0 }; });
+    const best = dayRows.filter((x) => x.has).sort((a, b) => b.r - a.r)[0];
+    html += '<div class="kpis">' +
+      kpiHtml('Trades', s.n, '', deltaTxt(s.n, prevList.length ? p.n : null, (v) => (v > 0 ? '+' : '−') + Math.abs(v), 'vs vorige')) +
+      kpiHtml('Winrate', s.winrate == null ? '–' : s.winrate + '%', '', s.wins + ' W · ' + s.losses + ' V') +
+      kpiHtml('Totaal R', fmtR(s.total), cls(s.total), deltaTxt(s.total, prevList.length ? p.total : null, fmtR, 'vs vorige')) +
+      kpiHtml('Resultaat', fmtMoney(s.money), cls(s.money), deltaTxt(s.money, prevList.length ? p.money : null, fmtMoney, 'vs vorige')) + '</div>';
+    html += '<div class="kpis three">' +
+      kpiHtml('Volgens plan', planPct + '%', planPct >= 80 ? 'win' : planPct < 50 ? 'loss' : '', clean0 + ' van ' + list.length + ' zonder fouten') +
+      kpiHtml('Expectancy', fmtR2(s.avg), cls(s.avg), 'per trade') +
+      kpiHtml('Beste dag', best ? best.k : '–', '', best ? '<span class="' + cls(best.r) + '">' + fmtR(best.r) + '</span>' : '') + '</div>';
+    const maxD = Math.max.apply(null, dayRows.map((x) => Math.abs(x.r))) || 1;
+    html += '<div class="card"><h3>Per dag</h3><div class="bars">' + dayRows.map((x) => {
+      const w = x.has ? Math.max(2, Math.round((Math.abs(x.r) / maxD) * 100)) : 0;
+      const col = x.r > 0 ? 'var(--win)' : x.r < 0 ? 'var(--loss)' : 'var(--muted)';
+      return '<span class="n">' + x.k + (x.has ? ' <span class="muted">· ' + x.n + '</span>' : '') + '</span><div class="track">' + (x.has ? '<div class="fill" style="width:' + w + '%;background:' + col + '"></div>' : '') + '</div><span class="val ' + (x.has ? cls(x.r) : 'be') + '">' + (x.has ? fmtR(x.r) : '–') + '</span>';
+    }).join('') + '</div></div>';
+    const closed = list.filter((t) => t.result_r != null).slice().sort((a, b) => Number(b.result_r) - Number(a.result_r));
+    if (closed.length) {
+      html += '<div class="field"><span class="lab">Beste trade</span>' + tradeCard(closed[0]) + '</div>';
+      if (closed.length > 1 && Number(closed[closed.length - 1].result_r) < Number(closed[0].result_r)) html += '<div class="field"><span class="lab">Slechtste trade</span>' + tradeCard(closed[closed.length - 1]) + '</div>';
+    }
+    html += '<div class="card"><h3>Fouten deze week</h3>' + (s.byMistake.length ? s.byMistake.map((m) =>
+      '<div class="row between" style="font-size:13px"><span>' + esc(m.k) + ' <span class="muted">· ' + m.n + 'x</span></span><span class="' + cls(m.r) + '">' + fmtR(m.r) + '</span></div>').join('')
+      : '<span class="hint">Geen fouten gemarkeerd deze week. Sterk, als dat klopt.</span>') + '</div>';
+    if (s.bySetup.length) html += '<div class="card"><h3>Setups deze week</h3>' + barsHtml(s.bySetup) + '</div>';
+  }
+
+  // reflectie
+  if (S.reviewsMissing) {
+    html += '<div class="card"><h3>Jouw review</h3><span class="hint">Om je weekreview op te slaan moet de database nog één keer bijgewerkt worden: draai <b>supabase-weekreview.sql</b> in de SQL Editor van Supabase en ververs de app.</span></div>';
+    return html;
+  }
+  const d = ensureDraft(key);
+  const saved = reviewFor(S.mode, key);
+  const ta = (k, label, ph) => '<label class="field"><span class="lab">' + label + '</span><textarea class="textarea" data-rf="' + k + '" rows="3" placeholder="' + esc(ph) + '" style="min-height:96px">' + esc(d[k]) + '</textarea></label>';
+  html += '<div class="card" style="gap:16px"><div class="row between"><h3>Jouw review</h3><span class="hint">' + (saved ? 'Opgeslagen · ' + clean(dfDay.format(new Date(saved.updated_at))) : 'Nog niet opgeslagen') + '</span></div>' +
+    '<div class="field"><span class="lab">Hoe gedisciplineerd was je? (1–5)</span><div class="grid5">' +
+      [1, 2, 3, 4, 5].map((n) => '<button type="button" class="opt' + (d.discipline === n ? ' on' : '') + '" data-a="rv-disc" data-v="' + n + '" aria-pressed="' + (d.discipline === n) + '">' + n + '</button>').join('') + '</div></div>' +
+    ta('went_well', 'Wat ging goed?', 'Bijv. alleen A+ setups genomen, rustig gebleven na een verlies') +
+    ta('improve', 'Wat kan beter?', 'Bijv. te vroeg ingestapt voor de sweep, geen trade tijdens nieuws') +
+    ta('focus', 'Focus voor volgende week', 'Eén concreet punt, bijv. wachten op M15-close boven het level') +
+    '<button type="button" class="btn primary" data-a="rv-save" style="height:50px"' + (S.busy ? ' disabled' : '') + '>' + (S.busy ? 'Opslaan…' : 'Review opslaan') + '</button></div>';
   return html;
 }
 function monitorHtml(a) {
@@ -773,7 +901,7 @@ function render() {
   const keep = {};
   document.querySelectorAll('[data-keep]').forEach((el) => { keep[el.getAttribute('data-keep')] = el.scrollTop; });
   const active = document.activeElement;
-  const activeKey = active && (active.getAttribute('data-f') || active.getAttribute('data-af'));
+  const activeKey = active && (active.getAttribute('data-f') || active.getAttribute('data-af') || active.getAttribute('data-rf'));
   let html;
   if (!S.ready) html = '<div class="login"><div class="spinner"></div></div>';
   else if (!S.session) html = loginHtml();
@@ -789,7 +917,7 @@ function render() {
   document.documentElement.style.overflow = (S.form || S.detail || S.accForm || S.lightbox) ? 'hidden' : '';
   document.querySelectorAll('[data-keep]').forEach((el) => { const k = el.getAttribute('data-keep'); if (keep[k]) el.scrollTop = keep[k]; });
   if (activeKey) {
-    const el = document.querySelector('[data-f="' + activeKey + '"],[data-af="' + activeKey + '"]');
+    const el = document.querySelector('[data-f="' + activeKey + '"],[data-af="' + activeKey + '"],[data-rf="' + activeKey + '"]');
     if (el && el.tagName !== 'SELECT') { el.focus({ preventScroll: true }); }
   }
 }
@@ -811,7 +939,7 @@ document.addEventListener('click', async (e) => {
   const v = el.getAttribute('data-v');
   const f = S.form;
   switch (a) {
-    case 'mode': S.mode = v; S.pair = 'all'; savePrefs(); render(); break;
+    case 'mode': S.mode = v; S.pair = 'all'; S.rv = null; savePrefs(); render(); break;
     case 'view': S.view = v; render(); window.scrollTo(0, 0); break;
     case 'period': S.period = v; savePrefs(); render(); break;
     case 'pair': S.pair = v; render(); break;
@@ -853,6 +981,12 @@ document.addEventListener('click', async (e) => {
     case 'acc-del': deleteAcc(v); break;
     case 'af-mode': S.accForm.mode = v; render(); break;
     case 'reload': loadAll(); break;
+    case 'stats-tab': S.statsTab = v; ls.set('statsTab', v); render(); break;
+    case 'wk-prev': S.weekOffset--; render(); break;
+    case 'wk-next': if (S.weekOffset < 0) { S.weekOffset++; render(); } break;
+    case 'wk-now': S.weekOffset = 0; render(); break;
+    case 'rv-disc': if (S.rv) { const n = Number(v); S.rv.discipline = S.rv.discipline === n ? null : n; S.rv.dirty = true; render(); } break;
+    case 'rv-save': saveReview(); break;
     case 'export': exportCsv(); break;
     case 'logout': if (confirm('Uitloggen?')) { await sb.auth.signOut(); } break;
     default: break;
@@ -862,6 +996,7 @@ document.addEventListener('input', (e) => {
   const t = e.target;
   if (t.hasAttribute('data-f') && S.form) S.form[t.getAttribute('data-f')] = t.value;
   else if (t.hasAttribute('data-af') && S.accForm) S.accForm[t.getAttribute('data-af')] = t.value;
+  else if (t.hasAttribute('data-rf') && S.rv) { S.rv[t.getAttribute('data-rf')] = t.value; S.rv.dirty = true; }
 });
 document.addEventListener('change', (e) => {
   const t = e.target;
@@ -921,6 +1056,6 @@ sb.auth.onAuthStateChange((event, session) => {
   if (!session) { S.accounts = []; S.trades = []; S.loaded = false; S.form = null; S.detail = null; S.accForm = null; }
   render();
 });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.session && S.loaded && !S.form && !S.accForm) loadAll(); });
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S.session && S.loaded && !S.form && !S.accForm && !(S.rv && S.rv.dirty)) loadAll(); });
 if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
 render();
